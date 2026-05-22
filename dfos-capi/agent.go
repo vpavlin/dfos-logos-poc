@@ -142,16 +142,21 @@ func (a *Agent) publishPost(text string) (string, error) {
 		"createdAt": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
-	docCID, docBytes, err := dfos.DocumentCID(doc)
+	// Compute the dag-cbor CID (the DFOS documentCID), but store JSON bytes
+	// as the blob because the feed reader uses json.Unmarshal.
+	docCID, cborBytes, err := dfos.DocumentCID(doc)
 	if err != nil {
 		return "", fmt.Errorf("document CID: %w", err)
+	}
+	jsonBytes, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("marshal doc: %w", err)
 	}
 
 	// Upload blob to Codex; BridgeStore.PutBlob is called later, but we need
 	// the DFOS CID for the content chain operation first.
-	// We pre-upload here and store the mapping in BridgeStore's CID cache.
 	if gCodexUpload != nil {
-		a.store.preUpload(docCID, docBytes)
+		a.store.preUpload(docCID, cborBytes)
 	}
 
 	// kid format for a non-genesis op: "did:dfos:xxx#key-0"
@@ -172,8 +177,12 @@ func (a *Agent) publishPost(text string) (string, error) {
 		return "", fmt.Errorf("ingest content: %s", msg)
 	}
 
-	// Store the blob so it can be served to other nodes.
-	a.store.PutBlob(relay.BlobKey{CreatorDID: a.did, DocumentCID: docCID}, docBytes)
+	// Store JSON blob (not CBOR) so GetBlob can be deserialized by feed readers.
+	blobData := jsonBytes
+	if gCodexUpload != nil {
+		blobData = cborBytes // Codex flow uses CBOR bytes for hashing integrity
+	}
+	a.store.PutBlob(relay.BlobKey{CreatorDID: a.did, DocumentCID: docCID}, blobData)
 
 	return contentID, nil
 }

@@ -1,0 +1,10 @@
+{
+  "name": "dfos_module",
+  "version": "0.1.0",
+  "description": "DFOS identity and content module for Logos Basecamp",
+  "author": "",
+  "type": "core",
+  "category": "general",
+  "main": "dfos_module_plugin",
+  "dependencies": []
+}

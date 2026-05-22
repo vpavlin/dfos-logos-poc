@@ -1,0 +1,1 @@
+/home/vpavlin/devel/github.com/vpavlin/dfos-logos-poc/dfos-capi/dfos.h
