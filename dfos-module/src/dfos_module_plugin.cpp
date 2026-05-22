@@ -3,13 +3,18 @@
 #include <QDebug>
 #include <QVariantList>
 #include <QByteArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QThread>
 
 #include "lib/dfos.h"
 
 DfosModulePlugin* DfosModulePlugin::s_instance = nullptr;
 
 static constexpr const char* kDeliveryModule = "delivery_module";
+static constexpr const char* kStorageModule  = "storage_module";
 static constexpr const char* kWakuTopic      = "/dfos/1/operations/proto";
+static constexpr qint64      kChunkSize      = 65536;
 
 DfosModulePlugin::DfosModulePlugin(QObject* parent)
     : QObject(parent)
@@ -37,15 +42,14 @@ QString DfosModulePlugin::start(const QString& dataDir)
         return R"({"error":"LogosAPI not initialized"})";
     }
 
-    // Wire the messageReceived event from delivery_module.
-    auto* client = deliveryClient();
-    if (client) {
-        LogosObject* replica = client->requestObject(kDeliveryModule);
+    // ── Wire delivery_module messageReceived ──────────────────────────────────
+    auto* delivClient = deliveryClient();
+    if (delivClient) {
+        LogosObject* replica = delivClient->requestObject(kDeliveryModule);
         if (replica) {
-            client->onEvent(replica, "messageReceived",
+            delivClient->onEvent(replica, "messageReceived",
                 [this](const QString& /*eventName*/, const QVariantList& data) {
                     if (data.size() < 3) return;
-                    // data[2] = payload (base64 of the raw JWS token string)
                     QByteArray raw = QByteArray::fromBase64(data[2].toString().toUtf8());
                     QString jws = QString::fromUtf8(raw);
                     qDebug() << "DfosModulePlugin: received op topic=" << data[1].toString()
@@ -57,15 +61,75 @@ QString DfosModulePlugin::start(const QString& dataDir)
         } else {
             qWarning() << "DfosModulePlugin: could not request delivery_module replica";
         }
-
-        // Subscribe to the DFOS proof plane topic.
-        client->invokeRemoteMethod(kDeliveryModule, "subscribe", QString(kWakuTopic));
+        delivClient->invokeRemoteMethod(kDeliveryModule, "subscribe", QString(kWakuTopic));
         qDebug() << "DfosModulePlugin: subscribed to" << kWakuTopic;
     } else {
-        qWarning() << "DfosModulePlugin: delivery_module client unavailable — Waku gossip disabled";
+        qWarning() << "DfosModulePlugin: delivery_module client unavailable";
     }
 
-    // Initialise the Go shared library.
+    // ── Wire storage_module events ────────────────────────────────────────────
+    auto* storClient = storageClient();
+    if (storClient) {
+        LogosObject* storReplica = storClient->requestObject(kStorageModule);
+        if (storReplica) {
+            // Collect download chunks.
+            storClient->onEvent(storReplica, "storageDownloadProgress",
+                [this](const QString&, const QVariantList& data) {
+                    if (data.isEmpty()) return;
+                    QJsonObject obj = QJsonDocument::fromJson(
+                        data[0].toString().toUtf8()).object();
+                    QString sid     = obj.value("sessionId").toString();
+                    QString chunk   = obj.value("chunk").toString();
+                    if (sid.isEmpty() || chunk.isEmpty()) return;
+
+                    QMutexLocker lk(&m_pendingMu);
+                    if (!m_downloadedData.contains(sid))
+                        m_downloadedData[sid] = QByteArray();
+                    m_downloadedData[sid].append(chunk.toUtf8());
+                });
+
+            // Finalise download: persist blob + release waiting thread.
+            storClient->onEvent(storReplica, "storageDownloadDone",
+                [this](const QString&, const QVariantList& data) {
+                    if (data.isEmpty()) return;
+                    QJsonObject obj = QJsonDocument::fromJson(
+                        data[0].toString().toUtf8()).object();
+                    QString sid     = obj.value("sessionId").toString();
+                    bool    success = obj.value("success").toBool();
+
+                    QMutexLocker lk(&m_pendingMu);
+                    QVariantMap meta = m_pendingDownloads.value(sid).toMap();
+                    QString creatorDID = meta.value("creatorDID").toString();
+                    QString docCID     = meta.value("docCID").toString();
+
+                    if (success && !creatorDID.isEmpty() && !docCID.isEmpty()) {
+                        QByteArray blob = m_downloadedData.value(sid);
+                        if (!blob.isEmpty()) {
+                            QByteArray cdid   = creatorDID.toUtf8();
+                            QByteArray ddocid = docCID.toUtf8();
+                            dfos_put_blob_for_content(cdid.data(), ddocid.data(), blob.data());
+                            qDebug() << "DfosModulePlugin: stored downloaded blob"
+                                     << docCID << blob.size() << "bytes";
+                        }
+                    }
+
+                    // Release any thread waiting on this download.
+                    if (m_downloadSems.contains(sid))
+                        m_downloadSems[sid]->release();
+
+                    m_pendingDownloads.remove(sid);
+                    m_downloadedData.remove(sid);
+                });
+
+            qDebug() << "DfosModulePlugin: wired storage_module events";
+        } else {
+            qWarning() << "DfosModulePlugin: could not request storage_module replica";
+        }
+    } else {
+        qWarning() << "DfosModulePlugin: storage_module client unavailable — blobs stored locally";
+    }
+
+    // ── Initialise Go relay ───────────────────────────────────────────────────
     QByteArray dataDirBytes = dataDir.toUtf8();
     char* errPtr = dfos_init(dataDirBytes.data(), wakuPublishCb, nullptr, nullptr);
     if (errPtr) {
@@ -104,6 +168,14 @@ QString DfosModulePlugin::publishPost(const QString& text)
     if (!result) return "{}";
     QString s = QString::fromUtf8(result);
     dfos_free(result);
+
+    // Async-upload the blob to storage_module so other nodes can retrieve it.
+    // We extract the contentId from the result JSON and pass it to a worker thread.
+    QJsonObject resObj = QJsonDocument::fromJson(s.toUtf8()).object();
+    QString contentId  = resObj.value("contentId").toString();
+    if (!contentId.isEmpty() && storageClient())
+        QThread::create([this, contentId] { asyncStoreBlob(contentId); })->start();
+
     return s;
 }
 
@@ -114,6 +186,100 @@ QString DfosModulePlugin::getFeed(int limit)
     QString s = QString::fromUtf8(result);
     dfos_free(result);
     return s;
+}
+
+// ── Storage helpers ───────────────────────────────────────────────────────────
+
+void DfosModulePlugin::asyncStoreBlob(const QString& contentId)
+{
+    // dfos_get_blob_for_content is thread-safe (reads from SQLite).
+    QByteArray cid = contentId.toUtf8();
+    char* raw = dfos_get_blob_for_content(cid.data());
+    if (!raw) return;
+    QJsonObject meta = QJsonDocument::fromJson(QByteArray(raw)).object();
+    dfos_free(raw);
+
+    QString docCID     = meta.value("docCID").toString();
+    QString creatorDID = meta.value("creatorDID").toString();
+    QString blobData   = meta.value("data").toString();
+
+    if (docCID.isEmpty() || blobData.isEmpty()) return;
+
+    QString storageCID = uploadBlobToStorage(docCID, creatorDID, blobData);
+    if (storageCID.isEmpty()) {
+        qWarning() << "DfosModulePlugin: storage upload failed for" << docCID;
+        return;
+    }
+    qDebug() << "DfosModulePlugin: blob stored docCID=" << docCID
+             << "storageCID=" << storageCID;
+}
+
+QString DfosModulePlugin::uploadBlobToStorage(const QString& docCID,
+                                               const QString& /*creatorDID*/,
+                                               const QString& blobData)
+{
+    auto* sc = storageClient();
+    if (!sc) return {};
+
+    // storage_module returns StdLogosResult serialized as JSON: {"success":bool,"value":...,"error":...}
+    auto parseResult = [](const QVariant& v) -> QJsonObject {
+        return QJsonDocument::fromJson(v.toString().toUtf8()).object();
+    };
+
+    // uploadInit — synchronous, returns JSON {success, value: sessionId}.
+    QJsonObject o1 = parseResult(sc->invokeRemoteMethod(kStorageModule, "uploadInit",
+        QVariant(docCID), QVariant(kChunkSize)));
+    if (!o1.value("success").toBool()) {
+        qWarning() << "DfosModulePlugin: uploadInit failed:" << o1.value("error").toString();
+        return {};
+    }
+    QString sessionId = o1.value("value").toString();
+
+    // uploadChunk — queues chunk; storage_module processes asynchronously.
+    QJsonObject o2 = parseResult(sc->invokeRemoteMethod(kStorageModule, "uploadChunk",
+        QVariant(sessionId), QVariant(blobData)));
+    if (!o2.value("success").toBool()) {
+        qWarning() << "DfosModulePlugin: uploadChunk failed:" << o2.value("error").toString();
+        return {};
+    }
+
+    // uploadFinalize — synchronous, returns JSON {success, value: CID}.
+    QJsonObject o3 = parseResult(sc->invokeRemoteMethod(kStorageModule, "uploadFinalize",
+        QVariant(sessionId)));
+    if (!o3.value("success").toBool()) {
+        qWarning() << "DfosModulePlugin: uploadFinalize failed:" << o3.value("error").toString();
+        return {};
+    }
+    return o3.value("value").toString();
+}
+
+bool DfosModulePlugin::downloadBlobFromStorage(const QString& storageCID,
+                                                const QString& creatorDID,
+                                                const QString& docCID)
+{
+    auto* sc = storageClient();
+    if (!sc) return false;
+
+    // downloadChunks — returns JSON {success, value: sessionId}; events are async.
+    QJsonObject rd = QJsonDocument::fromJson(
+        sc->invokeRemoteMethod(kStorageModule, "downloadChunks",
+            QVariant(storageCID), QVariant(false), QVariant(kChunkSize)).toString().toUtf8()).object();
+    if (!rd.value("success").toBool()) {
+        qWarning() << "DfosModulePlugin: downloadChunks failed:" << rd.value("error").toString();
+        return false;
+    }
+    QString sessionId = rd.value("value").toString();
+
+    // Register metadata keyed by sessionId so the storageDownloadDone handler can persist.
+    QMutexLocker lk(&m_pendingMu);
+    QVariantMap meta;
+    meta["creatorDID"] = creatorDID;
+    meta["docCID"]     = docCID;
+    m_pendingDownloads[sessionId] = meta;
+
+    qDebug() << "DfosModulePlugin: download started storageCID=" << storageCID
+             << "sessionId=" << sessionId;
+    return true;
 }
 
 // ── Static callbacks ─────────────────────────────────────────────────────────
@@ -136,4 +302,10 @@ LogosAPIClient* DfosModulePlugin::deliveryClient()
 {
     if (!logosAPI) return nullptr;
     return logosAPI->getClient(kDeliveryModule);
+}
+
+LogosAPIClient* DfosModulePlugin::storageClient()
+{
+    if (!logosAPI) return nullptr;
+    return logosAPI->getClient(kStorageModule);
 }

@@ -3,6 +3,8 @@
 #include <QObject>
 #include <QString>
 #include <QMutex>
+#include <QSemaphore>
+#include <QVariantMap>
 
 #include "interface.h"
 #include "logos_api.h"
@@ -24,7 +26,7 @@ public:
 
     Q_INVOKABLE void initLogos(LogosAPI* api);
 
-    // Called after delivery_module is started; dataDir is where SQLite + keys are stored.
+    // Called after delivery_module is started; dataDir is where SQLite + keys live.
     Q_INVOKABLE QString start(const QString& dataDir);
 
     Q_INVOKABLE QString createIdentity();
@@ -36,10 +38,42 @@ signals:
     void eventResponse(const QString& eventName, const QVariantList& args);
 
 private:
+    // ── delivery_module helpers ───────────────────────────────────────────────
     LogosAPIClient* deliveryClient();
 
-    // Static C callbacks passed to the Go shared library.
+    // ── storage_module helpers ────────────────────────────────────────────────
+    LogosAPIClient* storageClient();
+
+    // Upload blob to storage_module (synchronous: init→chunk→finalize).
+    // Returns the storage CID, or empty string on failure.
+    QString uploadBlobToStorage(const QString& docCID,
+                                const QString& creatorDID,
+                                const QString& blobData);
+
+    // Download blob from storage_module and persist locally (async via events).
+    // storageCID: the CID returned by a previous upload.
+    // Returns false if the download request could not be sent.
+    bool downloadBlobFromStorage(const QString& storageCID,
+                                 const QString& creatorDID,
+                                 const QString& docCID);
+
+    // Async upload worker: called from a QThread so the Qt main thread isn't
+    // blocked while storage_module processes the upload.
+    void asyncStoreBlob(const QString& contentId);
+
+    // ── Static C callbacks ────────────────────────────────────────────────────
     static void wakuPublishCb(const char* topic, const char* payload);
 
+    // ── State ─────────────────────────────────────────────────────────────────
     static DfosModulePlugin* s_instance;
+
+    // logosAPI is inherited from PluginInterface (checked by the framework in callMethod).
+
+    // Pending download: storageCID → {creatorDID, docCID} for the download done handler.
+    QMutex          m_pendingMu;
+    QVariantMap     m_pendingDownloads; // storageCID → QVariantMap{creatorDID, docCID}
+
+    // Semaphore released by storageDownloadDone for a given storageCID.
+    QMap<QString, QSemaphore*> m_downloadSems;
+    QMap<QString, QByteArray>  m_downloadedData; // storageCID → collected chunks
 };

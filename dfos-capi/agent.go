@@ -187,6 +187,42 @@ func (a *Agent) publishPost(text string) (string, error) {
 	return contentID, nil
 }
 
+// BlobInfo is returned by getBlobForContent and passed to the C++ storage bridge.
+type BlobInfo struct {
+	DocCID     string `json:"docCID"`
+	CreatorDID string `json:"creatorDID"`
+	Data       string `json:"data"` // raw UTF-8 blob bytes
+}
+
+func (a *Agent) getBlobForContent(contentID string) (*BlobInfo, error) {
+	chains, err := a.store.ListContentChains()
+	if err != nil {
+		return nil, err
+	}
+	for _, chain := range chains {
+		if chain.ContentID != contentID {
+			continue
+		}
+		if chain.State.CurrentDocumentCID == nil {
+			return nil, nil
+		}
+		docCID := *chain.State.CurrentDocumentCID
+		blob, err := a.store.GetBlob(relay.BlobKey{
+			CreatorDID:  chain.State.CreatorDID,
+			DocumentCID: docCID,
+		})
+		if err != nil || len(blob) == 0 {
+			return nil, err
+		}
+		return &BlobInfo{
+			DocCID:     docCID,
+			CreatorDID: chain.State.CreatorDID,
+			Data:       string(blob),
+		}, nil
+	}
+	return nil, nil
+}
+
 func (a *Agent) getFeed(limit int) ([]FeedPost, error) {
 	chains, err := a.store.ListContentChains()
 	if err != nil {

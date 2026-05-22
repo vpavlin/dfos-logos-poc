@@ -23,6 +23,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"unsafe"
+
+	relay "github.com/metalabel/dfos/packages/dfos-web-relay-go"
 )
 
 var (
@@ -100,6 +102,41 @@ func dfos_ingest_operation(jws *C.char) {
 		return
 	}
 	gAgent.relay.Ingest([]string{C.GoString(jws)})
+}
+
+// dfos_get_blob_for_content returns the blob for a published content item.
+// Result JSON: {"docCID":"...","creatorDID":"...","data":"<raw utf-8 blob>"}
+// Returns nil when the content or its blob cannot be found.
+//
+//export dfos_get_blob_for_content
+func dfos_get_blob_for_content(contentID *C.char) *C.char {
+	if gAgent == nil {
+		return nil
+	}
+	result, err := gAgent.getBlobForContent(C.GoString(contentID))
+	if err != nil || result == nil {
+		return nil
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil
+	}
+	return C.CString(string(data))
+}
+
+// dfos_put_blob_for_content stores a downloaded blob in the local relay store.
+// data must be the raw UTF-8 blob bytes (not base64).
+//
+//export dfos_put_blob_for_content
+func dfos_put_blob_for_content(creatorDID *C.char, docCID *C.char, data *C.char) {
+	if gAgent == nil {
+		return
+	}
+	relay_key := relay.BlobKey{
+		CreatorDID:  C.GoString(creatorDID),
+		DocumentCID: C.GoString(docCID),
+	}
+	_ = gAgent.store.SQLiteStore.PutBlob(relay_key, []byte(C.GoString(data)))
 }
 
 //export dfos_free
