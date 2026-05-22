@@ -8,6 +8,7 @@ Logos Basecamp as a native core module + optional QML UI.
 ```
 Logos Basecamp (host)
 ├── delivery_module  ← existing Waku transport (Logos)
+├── storage_module   ← existing Codex blob storage (Logos)  [Phase 1.5]
 ├── dfos_module      ← Phase 1: Go DFOS protocol via CGo shared library
 └── dfos_ui          ← Phase 2: Qt/QML feed + compose UI (IComponent)
          │
@@ -17,6 +18,10 @@ Logos Basecamp (host)
          ▼
 dfos-protocol-go + dfos-web-relay-go  (vendored from metalabel/dfos)
 ```
+
+**Two planes of propagation:**
+- **Proof plane** (JWS operations) — travels via Waku gossip (`delivery_module`). Confirmed working across nodes.
+- **Blob plane** (post content) — stored locally; cross-node retrieval requires a `documentCID → storageCID` mapping exchange (future work).
 
 ## Phases
 
@@ -102,6 +107,30 @@ QT_QPA_PLATFORM=offscreen ./test_load ./modules/dfos_ui.so
 To display in Basecamp: install `dfos_ui.so` + `metadata.json` to
 `$LOGOS_DATA_DIR/Dev/plugins/dfos_ui/` and restart Basecamp.
 
+### Phase 1.5 — `storage_module` blob storage integration
+
+Extends `dfos_module` to use Logos `storage_module` (Codex-backed) for
+blob storage instead of local-only SQLite.  Two new C exports bridge the
+Go relay to the C++ storage pipeline:
+
+| Export | Description |
+|--------|-------------|
+| `dfos_get_blob_for_content(contentId)` | Returns `{docCID, creatorDID, data}` JSON for upload |
+| `dfos_put_blob_for_content(creatorDID, docCID, data)` | Persists a downloaded blob into the local relay store |
+
+The C++ plugin side:
+- After `publishPost`, spawns a worker thread calling `asyncStoreBlob` → `uploadBlobToStorage`.
+- `uploadBlobToStorage` calls `storage_module.uploadInit` → `uploadChunk` → `uploadFinalize` (all via `LogosAPIClient::invokeRemoteMethod`).
+- `downloadBlobFromStorage` calls `storage_module.downloadChunks`, tracks the async `storageDownloadProgress` + `storageDownloadDone` events keyed by `sessionId`.
+
+**Key bugs found and fixed during this phase** (documented here for future integrators):
+
+| Bug | Root cause | Fix |
+|-----|-----------|-----|
+| `LogosAPI not available` in callMethod | `DfosModulePlugin` declared a private `LogosAPI* logosAPI = nullptr` that shadowed the `PluginInterface` base class field. `initLogos()` wrote to the derived-class copy; the framework checked the base-class copy (which stayed `nullptr`). | Removed the private member; use the inherited `PluginInterface::logosAPI` directly. |
+| `uploadInit failed: ""` despite success in debug | `storage_module` uses the "universal interface" type, whose generated `logos_provider_dispatch.cpp` serializes `StdLogosResult` to a JSON **string** before returning. Calling `result.value<LogosResult>()` silently returns a default-constructed `{success=false}` struct. | Parse the returned `QVariant` as a JSON string: `QJsonDocument::fromJson(v.toString().toUtf8()).object()`. |
+| Download event handler never fired | `m_pendingDownloads` was keyed by `storageCID`, but `storageDownloadDone` provides `sessionId`. | Call `downloadChunks` first, extract `sessionId` from its JSON response, register `m_pendingDownloads[sessionId]`. |
+
 ### Phase 3 — two-agent gossip integration test
 
 Go test in `dfos-capi/` that creates two independent Agent instances
@@ -124,6 +153,36 @@ Bob's feed total=2  alice=1  bob=1
 PASS
 ```
 
+### Phase 4 — two-node Waku gossip integration test
+
+End-to-end test using two real `logoscore` processes (Bob in background,
+Alice in foreground) connected via Waku gossip.
+
+```bash
+bash scripts/two_node_waku_test.sh
+```
+
+What it validates:
+1. Bob starts with a fixed TCP port (`60001`) and creates a DID.
+2. Alice starts on port `60002` with Bob's multiaddr as `entryNodes`, creates a DID, publishes a post, and confirms she sees her own post in the feed.
+3. After 10 s of gossip settling, Bob's log is checked for `ingest complete ... new=1` — proving the JWS operation propagated across nodes via real Waku.
+
+Result:
+```
+PASS: 3  FAIL: 0
+```
+
+Confirmed outputs:
+```
+PASS: Bob created DID
+PASS: Alice sees her own post: Hello Bob from Alice via real Waku!
+PASS: Waku gossip: Bob's relay ingested Alice's content-create operation (new=1)
+```
+
+Bob's feed remains empty (expected): the blob is not auto-fetched because
+no `documentCID → storageCID` exchange exists yet. This is the next
+planned milestone.
+
 ## Key findings
 
 | Finding | Details |
@@ -134,3 +193,7 @@ PASS
 | `dfos.so` SONAME | Needs `patchelf --set-soname` + `--replace-needed` for `$ORIGIN` RPATH |
 | `onEvent` signature | Workspace SDK has 3-param form `(LogosObject*, name, callback)` |
 | Dummy peer entry needed | `relay.PeerConfig` with any URL so `gossipOps` fires |
+| Universal vs QtProvider interface | Universal-interface modules (storage_module) return `QVariant(QString)` containing serialized `StdLogosResult` JSON — never `QVariant(LogosResult)`. Always parse with `fromJson(v.toString().toUtf8())`. |
+| Private member shadowing PluginInterface | Declaring `LogosAPI* logosAPI` in the plugin class shadows the base class field the framework checks. Use the inherited field only. |
+| sessionId vs storageCID tracking | `storage_module` download events are keyed by `sessionId` (returned by `downloadChunks`), not by `storageCID`. |
+| Proof plane vs blob plane | Waku gossip propagates JWS operations (proof plane). Blobs require a separate `documentCID → storageCID` mapping exchange. |
