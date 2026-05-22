@@ -11,10 +11,11 @@
 
 DfosModulePlugin* DfosModulePlugin::s_instance = nullptr;
 
-static constexpr const char* kDeliveryModule = "delivery_module";
-static constexpr const char* kStorageModule  = "storage_module";
-static constexpr const char* kWakuTopic      = "/dfos/1/operations/proto";
-static constexpr qint64      kChunkSize      = 65536;
+static constexpr const char* kDeliveryModule  = "delivery_module";
+static constexpr const char* kStorageModule   = "storage_module";
+static constexpr const char* kWakuTopic       = "/dfos/1/operations/proto";
+static constexpr const char* kStorageMapTopic = "/dfos/1/storage-map/proto";
+static constexpr qint64      kChunkSize       = 65536;
 
 DfosModulePlugin::DfosModulePlugin(QObject* parent)
     : QObject(parent)
@@ -50,19 +51,36 @@ QString DfosModulePlugin::start(const QString& dataDir)
             delivClient->onEvent(replica, "messageReceived",
                 [this](const QString& /*eventName*/, const QVariantList& data) {
                     if (data.size() < 3) return;
+                    QString topic = data[1].toString();
                     QByteArray raw = QByteArray::fromBase64(data[2].toString().toUtf8());
-                    QString jws = QString::fromUtf8(raw);
-                    qDebug() << "DfosModulePlugin: received op topic=" << data[1].toString()
-                             << "jws_len=" << jws.size();
-                    QByteArray jwsBytes = jws.toUtf8();
-                    dfos_ingest_operation(jwsBytes.data());
+
+                    if (topic == kWakuTopic) {
+                        QString jws = QString::fromUtf8(raw);
+                        qDebug() << "DfosModulePlugin: received op topic=" << topic
+                                 << "jws_len=" << jws.size();
+                        QByteArray jwsBytes = jws.toUtf8();
+                        dfos_ingest_operation(jwsBytes.data());
+                    } else if (topic == kStorageMapTopic) {
+                        QJsonObject obj = QJsonDocument::fromJson(raw).object();
+                        QString docCID     = obj.value("docCID").toString();
+                        QString storageCID = obj.value("storageCID").toString();
+                        QString creatorDID = obj.value("creatorDID").toString();
+                        qDebug() << "DfosModulePlugin: received storage-map docCID=" << docCID
+                                 << "storageCID=" << storageCID;
+                        if (!docCID.isEmpty() && !storageCID.isEmpty()) {
+                            QByteArray d = docCID.toUtf8(), s = storageCID.toUtf8(), c = creatorDID.toUtf8();
+                            dfos_set_storage_cid(d.data(), s.data(), c.data());
+                            downloadBlobFromStorage(storageCID, creatorDID, docCID);
+                        }
+                    }
                 });
             qDebug() << "DfosModulePlugin: wired messageReceived";
         } else {
             qWarning() << "DfosModulePlugin: could not request delivery_module replica";
         }
         delivClient->invokeRemoteMethod(kDeliveryModule, "subscribe", QString(kWakuTopic));
-        qDebug() << "DfosModulePlugin: subscribed to" << kWakuTopic;
+        delivClient->invokeRemoteMethod(kDeliveryModule, "subscribe", QString(kStorageMapTopic));
+        qDebug() << "DfosModulePlugin: subscribed to" << kWakuTopic << "and" << kStorageMapTopic;
     } else {
         qWarning() << "DfosModulePlugin: delivery_module client unavailable";
     }
@@ -169,12 +187,13 @@ QString DfosModulePlugin::publishPost(const QString& text)
     QString s = QString::fromUtf8(result);
     dfos_free(result);
 
-    // Async-upload the blob to storage_module so other nodes can retrieve it.
-    // We extract the contentId from the result JSON and pass it to a worker thread.
+    // Upload blob to storage_module and broadcast the docCID→storageCID mapping
+    // so peer nodes can retrieve the blob. Done inline (not async) so the
+    // mapping is published before the caller continues.
     QJsonObject resObj = QJsonDocument::fromJson(s.toUtf8()).object();
     QString contentId  = resObj.value("contentId").toString();
     if (!contentId.isEmpty() && storageClient())
-        QThread::create([this, contentId] { asyncStoreBlob(contentId); })->start();
+        asyncStoreBlob(contentId);
 
     return s;
 }
@@ -212,6 +231,23 @@ void DfosModulePlugin::asyncStoreBlob(const QString& contentId)
     }
     qDebug() << "DfosModulePlugin: blob stored docCID=" << docCID
              << "storageCID=" << storageCID;
+
+    // Persist the mapping locally.
+    {
+        QByteArray d = docCID.toUtf8(), s = storageCID.toUtf8(), c = creatorDID.toUtf8();
+        dfos_set_storage_cid(d.data(), s.data(), c.data());
+    }
+
+    // Broadcast the docCID → storageCID mapping so peer nodes can fetch the blob.
+    QJsonObject mapMsg;
+    mapMsg["docCID"]     = docCID;
+    mapMsg["storageCID"] = storageCID;
+    mapMsg["creatorDID"] = creatorDID;
+    QString mapPayload = QJsonDocument(mapMsg).toJson(QJsonDocument::Compact);
+    if (auto* dc = deliveryClient())
+        dc->invokeRemoteMethod(kDeliveryModule, "send",
+            QString(kStorageMapTopic), mapPayload);
+    qDebug() << "DfosModulePlugin: published storage-map for docCID=" << docCID;
 }
 
 QString DfosModulePlugin::uploadBlobToStorage(const QString& docCID,

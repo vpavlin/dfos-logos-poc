@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	dfos "github.com/metalabel/dfos/packages/dfos-protocol-go"
@@ -21,14 +22,22 @@ type FeedPost struct {
 	CreatedAt  string `json:"createdAt"`
 }
 
+// storageCIDEntry maps a DFOS documentCID to its storage_module CID.
+type storageCIDEntry struct {
+	StorageCID string
+	CreatorDID string
+}
+
 // Agent holds all per-instance state: relay, keys, identity.
 type Agent struct {
-	relay   *relay.Relay
-	store   *BridgeStore
-	dataDir string
-	priv    ed25519.PrivateKey
-	did     string
-	keyID   string
+	relay      *relay.Relay
+	store      *BridgeStore
+	dataDir    string
+	priv       ed25519.PrivateKey
+	did        string
+	keyID      string
+	storageMu  sync.RWMutex
+	storageCIDs map[string]storageCIDEntry // docCID → {storageCID, creatorDID}
 }
 
 // keyFile is persisted to disk to survive restarts.
@@ -56,9 +65,10 @@ func newAgent(dataDir string) (*Agent, error) {
 		{URL: "waku://broadcast", ReadThrough: &falseBool, Sync: &falseBool},
 	}
 
+	wakuClient := &WakuPeerClient{}
 	r, err := relay.NewRelay(relay.RelayOptions{
 		Store:      store,
-		PeerClient: &WakuPeerClient{},
+		PeerClient: wakuClient,
 		Peers:      peers,
 	})
 	if err != nil {
@@ -66,6 +76,7 @@ func newAgent(dataDir string) (*Agent, error) {
 	}
 
 	agent := &Agent{relay: r, store: store, dataDir: dataDir}
+	wakuClient.startRetryLoop()
 
 	// Load persisted key if present.
 	keyPath := filepath.Join(dataDir, "key.json")
@@ -270,4 +281,26 @@ func (a *Agent) getFeed(limit int) ([]FeedPost, error) {
 		posts = []FeedPost{}
 	}
 	return posts, nil
+}
+
+func (a *Agent) setStorageCID(docCID, storageCID, creatorDID string) {
+	a.storageMu.Lock()
+	defer a.storageMu.Unlock()
+	if a.storageCIDs == nil {
+		a.storageCIDs = make(map[string]storageCIDEntry)
+	}
+	a.storageCIDs[docCID] = storageCIDEntry{StorageCID: storageCID, CreatorDID: creatorDID}
+}
+
+func (a *Agent) getStorageCID(docCID string) *storageCIDEntry {
+	a.storageMu.RLock()
+	defer a.storageMu.RUnlock()
+	if a.storageCIDs == nil {
+		return nil
+	}
+	e, ok := a.storageCIDs[docCID]
+	if !ok {
+		return nil
+	}
+	return &e
 }

@@ -124,6 +124,18 @@ func dfos_get_blob_for_content(contentID *C.char) *C.char {
 	return C.CString(string(data))
 }
 
+// dfos_set_storage_cid records the storage_module CID for a DFOS documentCID.
+// Called by the C++ plugin after a successful upload so the mapping can be
+// used to trigger downloads on peer nodes that receive the storage-map Waku message.
+//
+//export dfos_set_storage_cid
+func dfos_set_storage_cid(docCID *C.char, storageCID *C.char, creatorDID *C.char) {
+	if gAgent == nil {
+		return
+	}
+	gAgent.setStorageCID(C.GoString(docCID), C.GoString(storageCID), C.GoString(creatorDID))
+}
+
 // dfos_put_blob_for_content stores a downloaded blob in the local relay store.
 // data must be the raw UTF-8 blob bytes (not base64).
 //
