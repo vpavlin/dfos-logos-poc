@@ -1,0 +1,3 @@
+[submodule "vendor/dfos"]
+	path = vendor/dfos
+	url = https://github.com/metalabel/dfos.git
