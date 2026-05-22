@@ -1,0 +1,10 @@
+{
+  "name": "dfos_ui",
+  "version": "0.1.0",
+  "description": "DFOS feed and identity UI for Logos Basecamp",
+  "author": "",
+  "type": "ui",
+  "category": "general",
+  "main": "dfos_ui",
+  "dependencies": []
+}
